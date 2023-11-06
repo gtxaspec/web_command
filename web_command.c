@@ -9,7 +9,7 @@
 #include <errno.h>
 
 #define MAX_PAYLOAD_SIZE 1024
-#define MAX_HTTP_BODY_SIZE 4096	// Adjust as necessary for maximum expected POST body size
+#define MAX_HTTP_BODY_SIZE 4096	// Adjust as necessary for our POST body size
 #define CONFIG_FILE "test.config"
 #define HTTP_PORT 8078
 
@@ -22,6 +22,8 @@ struct http_request_data {
 // Function prototypes
 int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 void execute_command(const char *command);
+bool load_configuration(const char *filepath, char **config_data);
+bool is_command_allowed(const char *command, const cJSON *config_json);
 
 // Updated protocols array with explicit zero initializers for all fields
 static const struct lws_protocols protocols[] = {
@@ -43,6 +45,62 @@ static const struct lws_protocols protocols[] = {
 	}
 };
 
+bool is_command_allowed(const char *command, const cJSON *config_json) {
+	const cJSON *command_json = cJSON_GetObjectItemCaseSensitive(config_json, command);
+	return command_json != NULL;
+}
+
+bool load_configuration(const char *filepath, char **config_data) {
+	FILE *config_file = fopen(filepath, "r");
+	if (config_file == NULL) {
+		return false;
+	}
+
+	fseek(config_file, 0, SEEK_END);
+	long config_size = ftell(config_file);
+	rewind(config_file);
+
+	*config_data = (char *)malloc(config_size + 1);
+	if (*config_data == NULL) {
+		fclose(config_file);
+		return false;
+	}
+
+	fread(*config_data, config_size, 1, config_file);
+	(*config_data)[config_size] = '\0'; // Ensure null termination
+	fclose(config_file);
+	return true;
+}
+
+void execute_command(const char *command) {
+    fprintf(stderr, "Executing command: %s\n", command);
+    pid_t pid = fork();
+    if (pid == -1) {
+        // Handle error in fork()
+        fprintf(stderr, "Fork failed: %s\n", strerror(errno));
+    } else if (pid > 0) {
+        // Parent process: immediately return, do not wait for the child
+    } else {
+        // First child process
+        pid_t pid_inner = fork();
+        if (pid_inner == -1) {
+            // Handle error in second fork
+            exit(EXIT_FAILURE);
+        } else if (pid_inner > 0) {
+            // Exit the first child process
+            exit(EXIT_SUCCESS);
+        } else {
+            // Second child process
+            // Close all open file descriptors if necessary (e.g., using closefrom(3))
+            // Set up a new session with setsid() if necessary
+            execlp("sh", "sh", "-c", command, NULL);
+            // If execlp() fails, exit the child process
+            fprintf(stderr, "execlp failed to execute command: %s\n", strerror(errno));
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
 int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
 	struct http_request_data *request_data = (struct http_request_data *)user;
 
@@ -53,20 +111,15 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 				memcpy(request_data->body + request_data->body_length, in, len);
 				request_data->body_length = new_len;
 			} else {
-				// Handle overflow
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Payload too large");
-				return 1; // Non-zero indicates error
+				return 1;
 			}
 			break;
 		}
 
 		case LWS_CALLBACK_HTTP_BODY_COMPLETION: {
-			// Null-terminate the body data
-			request_data->body[request_data->body_length] = '\0';
-
+			request_data->body[request_data->body_length] = '\0'; // Null-terminate the body data
 			fprintf(stderr, "Received body: %s\n", request_data->body);
-
-			// Process the command
 			cJSON *json = cJSON_ParseWithOpts((char *)request_data->body, NULL, true);
 			if (json == NULL) {
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Bad JSON");
@@ -82,112 +135,63 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 
 			fprintf(stderr, "Parsed command: %s\n", cmd->valuestring);
 
-			// Open the configuration file
 			char *config_data = NULL;
-			FILE *config_file = fopen(CONFIG_FILE, "r");
-			if (config_file != NULL) {
-				fseek(config_file, 0, SEEK_END);
-				long config_size = ftell(config_file);
-				rewind(config_file);
-
-				config_data = (char *)malloc(config_size + 1);
-				if (config_data) {
-					fread(config_data, config_size, 1, config_file);
-					config_data[config_size] = '\0'; // Ensure null termination
-				}
-				fclose(config_file);
-			}
-
-			if (config_data == NULL) {
-				lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, "Config File Error or Out of Memory");
+			if (!load_configuration(CONFIG_FILE, &config_data)) {
+				lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, "Config File Error");
 				cJSON_Delete(json);
 				break;
 			}
 
-			// Parse the configuration file
 			cJSON *config_json = cJSON_Parse(config_data);
 			free(config_data);
 
 			if (config_json == NULL) {
-				lws_return_http_status(wsi, HTTP_STATUS_INTERNAL_SERVER_ERROR, "Config Parsing Error");
+				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Configuration Parse Error");
 				cJSON_Delete(json);
 				break;
 			}
 
-			// Map command from request to command in configuration
 			cJSON *command_json = cJSON_GetObjectItemCaseSensitive(config_json, cmd->valuestring);
 			if (command_json == NULL) {
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Command Not Found");
-				cJSON_Delete(config_json);
 				cJSON_Delete(json);
+				cJSON_Delete(config_json);
 				break;
 			}
 
 			cJSON *command_item = cJSON_GetObjectItemCaseSensitive(command_json, "cmd");
 			if (command_item == NULL || !cJSON_IsString(command_item)) {
-				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Invalid 'cmd'");
-				cJSON_Delete(config_json);
+				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Invalid 'cmd' in configuration");
 				cJSON_Delete(json);
+				cJSON_Delete(config_json);
 				break;
 			}
 
-			// Execute the command
-			execute_command(command_item->valuestring);
+			// Execute the command only if it is a valid string
+			if (cJSON_IsString(command_item) && command_item->valuestring != NULL) {
+				execute_command(command_item->valuestring);
 
-			// Respond to HTTP request
-			lws_return_http_status(wsi, HTTP_STATUS_OK, "Command Executed");
+				lws_return_http_status(wsi, HTTP_STATUS_OK, "Command Executed");
+			} else {
+				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Command execution not possible");
+			}
 
-			cJSON_Delete(config_json);
 			cJSON_Delete(json);
+			cJSON_Delete(config_json);
 
-			// Inform lws to close the HTTP connection after the response is sent
 			if (lws_http_transaction_completed(wsi) != 0) {
-				// Handle the error
 				return 1;
 			}
 			break;
 		}
 
-		case LWS_CALLBACK_HTTP_DROP_PROTOCOL:
-			if (request_data) {
-				memset(request_data, 0, sizeof(struct http_request_data));
-			}
-			break;
+		// ... other cases go here
 
 		default:
 			break;
 	}
 
 	return 0;
-}
-
-void execute_command(const char *command) {
-	fprintf(stderr, "Executing command: %s\n", command);
-	pid_t pid = fork();
-	if (pid == -1) {
-		// Handle error in fork()
-		fprintf(stderr, "Fork failed: %s\n", strerror(errno));
-	} else if (pid > 0) {
-		// Parent process, no need to wait for the first child.
-		int status;
-		waitpid(pid, &status, 0);	// Wait for the first child to exit
-	} else {
-		// First child process
-		pid_t pid_inner = fork();
-		if (pid_inner == -1) {
-			// Handle error in second fork
-			exit(EXIT_FAILURE);
-		} else if (pid_inner > 0) {
-			// Exit the first child process
-			exit(EXIT_SUCCESS);
-		} else {
-			// Second child process
-			execlp("sh", "sh", "-c", command, NULL);
-			// If execlp() fails, exit the child process
-			fprintf(stderr, "execlp failed to execute command: %s\n", strerror(errno));
-			exit(EXIT_FAILURE);
-		}
-	}
 }
 
 int main(void) {
@@ -197,6 +201,9 @@ int main(void) {
 	info.protocols = protocols;
 	info.gid = -1;
 	info.uid = -1;
+
+	// Ignore SIGCHLD to prevent zombie processes
+	signal(SIGCHLD, SIG_IGN);
 
 	struct lws_context *context = lws_create_context(&info);
 	if (context == NULL) {
