@@ -7,11 +7,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/resource.h>
+#include <time.h>
 
 #define MAX_PAYLOAD_SIZE 1024
-#define MAX_HTTP_BODY_SIZE 4096	// Adjust as necessary for our POST body size
+#define MAX_HTTP_BODY_SIZE 4096 // Adjust as necessary for your POST body size
 #define CONFIG_FILE "test.config"
 #define HTTP_PORT 8078
+#define COMMAND_LIMIT 10
+#define TIME_SPAN 30 // seconds
 
 // HTTP POST request data structure
 struct http_request_data {
@@ -19,11 +23,18 @@ struct http_request_data {
 	size_t body_length;
 };
 
+// Rate limiting structure
+struct command_rate_limiter {
+	int count;
+	time_t start_time;
+} limiter = {0, 0};
+
 // Function prototypes
 int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len);
 void execute_command(const char *command);
 bool load_configuration(const char *filepath, char **config_data);
 bool is_command_allowed(const char *command, const cJSON *config_json);
+bool check_rate_limit();
 
 // Updated protocols array with explicit zero initializers for all fields
 static const struct lws_protocols protocols[] = {
@@ -36,18 +47,30 @@ static const struct lws_protocols protocols[] = {
 		.tx_packet_size = 0,
 	},
 	{
-		.name = NULL, 
-		.callback = NULL, 
-		.per_session_data_size = 0, 
+		.name = NULL,
+		.callback = NULL,
+		.per_session_data_size = 0,
 		.rx_buffer_size = 0,
 		.id = 0,
 		.tx_packet_size = 0,
 	}
 };
 
-bool is_command_allowed(const char *command, const cJSON *config_json) {
-	const cJSON *command_json = cJSON_GetObjectItemCaseSensitive(config_json, command);
-	return command_json != NULL;
+bool check_rate_limit() {
+	time_t current_time = time(NULL);
+	if (limiter.start_time == 0 || difftime(current_time, limiter.start_time) > TIME_SPAN) {
+		// Reset rate limiter
+		limiter.count = 1;
+		limiter.start_time = current_time;
+		return true;
+	} else if (limiter.count < COMMAND_LIMIT) {
+		// Increment the count and allow the command
+		limiter.count++;
+		return true;
+	} else {
+		// Rate limit exceeded
+		return false;
+	}
 }
 
 bool load_configuration(const char *filepath, char **config_data) {
@@ -66,39 +89,37 @@ bool load_configuration(const char *filepath, char **config_data) {
 		return false;
 	}
 
-	fread(*config_data, config_size, 1, config_file);
+	size_t read_size = fread(*config_data, 1, config_size, config_file);
+	if (read_size != (size_t)config_size) {
+		free(*config_data);
+		fclose(config_file);
+		return false;
+	}
+
 	(*config_data)[config_size] = '\0'; // Ensure null termination
 	fclose(config_file);
 	return true;
 }
 
 void execute_command(const char *command) {
-    fprintf(stderr, "Executing command: %s\n", command);
-    pid_t pid = fork();
-    if (pid == -1) {
-        // Handle error in fork()
-        fprintf(stderr, "Fork failed: %s\n", strerror(errno));
-    } else if (pid > 0) {
-        // Parent process: immediately return, do not wait for the child
-    } else {
-        // First child process
-        pid_t pid_inner = fork();
-        if (pid_inner == -1) {
-            // Handle error in second fork
-            exit(EXIT_FAILURE);
-        } else if (pid_inner > 0) {
-            // Exit the first child process
-            exit(EXIT_SUCCESS);
-        } else {
-            // Second child process
-            // Close all open file descriptors if necessary (e.g., using closefrom(3))
-            // Set up a new session with setsid() if necessary
-            execlp("sh", "sh", "-c", command, NULL);
-            // If execlp() fails, exit the child process
-            fprintf(stderr, "execlp failed to execute command: %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
-        }
-    }
+	fprintf(stderr, "Executing command: %s\n", command);
+	pid_t pid = fork();
+	if (pid == -1) {
+		// Handle error in fork()
+		fprintf(stderr, "Fork failed: %s\n", strerror(errno));
+	} else if (pid > 0) {
+		// Parent process: immediately return, do not wait for the child
+		// Non-blocking waitpid to clean up the zombie process
+		while (waitpid(pid, NULL, WNOHANG) > 0) {
+			// No blocking wait
+		}
+	} else {
+		// Child process
+		execlp("sh", "sh", "-c", command, NULL);
+		// If execlp() fails
+		fprintf(stderr, "execlp failed: %s\n", strerror(errno));
+		exit(EXIT_FAILURE);
+	}
 }
 
 int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user, void *in, size_t len) {
@@ -129,6 +150,17 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			cJSON *cmd = cJSON_GetObjectItemCaseSensitive(json, "command");
 			if (!cJSON_IsString(cmd) || cmd->valuestring == NULL) {
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Invalid Command");
+				cJSON_Delete(json);
+				break;
+			}
+
+			if (!check_rate_limit()) {
+				// If HTTP_STATUS_TOO_MANY_REQUESTS is not defined, define it or use an alternative
+				#ifndef HTTP_STATUS_TOO_MANY_REQUESTS
+				#define HTTP_STATUS_TOO_MANY_REQUESTS 429
+				#endif
+
+				lws_return_http_status(wsi, HTTP_STATUS_TOO_MANY_REQUESTS, "Rate limit exceeded");
 				cJSON_Delete(json);
 				break;
 			}
@@ -170,7 +202,6 @@ int callback_http(struct lws *wsi, enum lws_callback_reasons reason, void *user,
 			// Execute the command only if it is a valid string
 			if (cJSON_IsString(command_item) && command_item->valuestring != NULL) {
 				execute_command(command_item->valuestring);
-
 				lws_return_http_status(wsi, HTTP_STATUS_OK, "Command Executed");
 			} else {
 				lws_return_http_status(wsi, HTTP_STATUS_BAD_REQUEST, "Command execution not possible");
@@ -204,6 +235,15 @@ int main(void) {
 
 	// Ignore SIGCHLD to prevent zombie processes
 	signal(SIGCHLD, SIG_IGN);
+
+	// Set resource limits
+	struct rlimit rl;
+	rl.rlim_cur = 1024;
+	rl.rlim_max = 1024;
+	if (setrlimit(RLIMIT_NOFILE, &rl) != 0) {
+		fprintf(stderr, "Failed to set resource limits\n");
+		return 1;
+	}
 
 	struct lws_context *context = lws_create_context(&info);
 	if (context == NULL) {
