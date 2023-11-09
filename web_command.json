@@ -1,0 +1,36 @@
+{
+  "motor_left": {
+    "cmd": "t31-kmotor -s 900 -d g -x -200",
+    "return_output": true
+  },
+  "motor_right": {
+    "cmd": "t31-kmotor -s 900 -d g -x 200"
+  },
+  "motor_up": {
+    "cmd": "sleep 5"
+  },
+  "motor_down": {
+    "cmd": "sleep 5"
+  },
+  "IR1_on_v3": {
+    "cmd": "gpio set 47"
+  },
+  "IR1_off_v3": {
+    "cmd": "gpio clear 47"
+  },
+  "IR1_on_panv2": {
+    "cmd": "gpio set 60"
+  },
+  "IR1_off_panv2": {
+    "cmd": "gpio clear 60"
+  },
+  "IR2_on_v3": {
+    "cmd": "gpio set 49"
+  },
+  "IR2_off_v3": {
+    "cmd": "gpio clear 49"
+  },
+  "test1": {
+    "cmd": "whoami"
+  }
+}
